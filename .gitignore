@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+bin/
+obj/
+
+# Environment & Secrets
+.env
+.env.local
+
+# Build outputs & Logs
+.next/
+dist/
+logs/
+*.log
