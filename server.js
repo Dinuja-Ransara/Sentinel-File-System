@@ -11,10 +11,11 @@ const JWT=process.env.JWT_SECRET||K.jwt,MASTER=Buffer.from(process.env.MASTER_KE
 if(prod&&(!process.env.JWT_SECRET||!process.env.MASTER_KEY))throw new Error('Set JWT_SECRET and MASTER_KEY in production');
 if(MASTER.length!==32)throw new Error('MASTER_KEY must be 64 hex chars');
 const GB=1024**3,MB=1024**2;
+const BILLING=false; // v2: flip when paid plans + a payment provider ship
 const PLANS={
-free:{name:'Starter',price:0,quota:5*GB,maxFile:100*MB,links:10,maxHours:168,fit:'Documents, scans and school or side projects.',features:['5 GB encrypted storage','Files up to 100 MB','10 active share links','Links last up to 7 days','Free file converter']},
-plus:{name:'Plus',price:4,quota:200*GB,maxFile:1*GB,links:100,maxHours:720,fit:'Freelancers and families: photo libraries, design and work files.',features:['200 GB encrypted storage','Files up to 1 GB','100 active share links','Links last up to 30 days','Password-protected links','Download limits']},
-pro:{name:'Pro',price:10,quota:2048*GB,maxFile:2*GB,links:1000,maxHours:8760,fit:'Studios and small teams: video, large archives and client delivery.',features:['2 TB encrypted storage','Files up to 2 GB','1,000 active share links','Links last up to 1 year','Password-protected links','Download limits','Priority support']}};
+free:{name:'Starter',price:0,quota:5*GB,maxFile:100*MB,links:10,maxHours:168,fit:'Documents, scans and school or side projects.',features:['5 GB encrypted storage','Files up to 100 MB','10 active share links','Links last up to 7 days','Password-protected links','Download limits','Free file converter']},
+plus:{name:'Plus',price:4,quota:200*GB,maxFile:1*GB,links:100,maxHours:720,fit:'Freelancers and families: photo libraries, design and work files.',features:['200 GB encrypted storage','Files up to 1 GB','100 active share links','Links last up to 30 days','Everything in Starter']},
+pro:{name:'Pro',price:10,quota:2048*GB,maxFile:2*GB,links:1000,maxHours:8760,fit:'Studios and small teams: video, large archives and client delivery.',features:['2 TB encrypted storage','Files up to 2 GB','1,000 active share links','Links last up to 1 year','Everything in Plus','Priority support']}};
 const db=new DatabaseSync(path.join(D,'sentinel.db'));db.exec('PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;');
 db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,name TEXT,hash TEXT NOT NULL,plan TEXT DEFAULT 'free',stripe_customer TEXT,created INTEGER);
 CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name TEXT,size INTEGER,mime TEXT,iv TEXT,tag TEXT,wkey TEXT,created INTEGER);
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS links(id TEXT PRIMARY KEY,file_id TEXT NOT NULL REFER
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT,action TEXT,detail TEXT,ip TEXT,ts INTEGER);`);
 try{db.exec('ALTER TABLE users ADD COLUMN tv INTEGER DEFAULT 0')}catch{}
 for(const c of['starred INTEGER DEFAULT 0','trashed INTEGER'])try{db.exec('ALTER TABLE files ADD COLUMN '+c)}catch{}
+try{db.exec('ALTER TABLE users ADD COLUMN google INTEGER DEFAULT 0')}catch{}
 const uid=()=>crypto.randomUUID(),now=()=>Date.now(),sha=s=>crypto.createHash('sha256').update(s).digest('hex');
 const log=(u,a,d,req)=>db.prepare('INSERT INTO audit(user_id,action,detail,ip,ts) VALUES(?,?,?,?,?)').run(u,a,d||'',req?.ip||'',now());
 const BLOCK=/\.(exe|bat|cmd|com|scr|msi|vbs|js|jar|ps1|sh|dll|apk)$/i;
@@ -33,22 +35,15 @@ function sendFile(f,res){const k=unwrap(f.wkey),d=crypto.createDecipheriv('aes-2
  const s=fs.createReadStream(path.join(FD,f.id));s.on('error',()=>res.destroy());d.on('error',()=>res.destroy());s.pipe(d).pipe(res)}
 const app=express();app.set('trust proxy',1);
 app.use(helmet({contentSecurityPolicy:{directives:{defaultSrc:["'self'"],scriptSrc:["'self'"],styleSrc:["'self'","'unsafe-inline'"],imgSrc:["'self'","data:"],objectSrc:["'none'"],frameAncestors:["'none'"]}}}));
-// Stripe webhook needs raw body (before json parser)
-app.post('/api/billing/webhook',express.raw({type:'*/*'}),(req,res)=>{
- const sec=process.env.STRIPE_WEBHOOK_SECRET;if(!sec)return res.sendStatus(503);
- const h=Object.fromEntries((req.get('stripe-signature')||'').split(',').map(p=>p.split('=')));
- const exp=crypto.createHmac('sha256',sec).update(`${h.t}.${req.body}`).digest('hex');
- let ok=false;try{ok=h.v1&&crypto.timingSafeEqual(Buffer.from(exp),Buffer.from(h.v1))&&Math.abs(Date.now()/1000-h.t)<300}catch{}
- if(!ok)return res.sendStatus(400);const ev=JSON.parse(req.body),o=ev.data.object;
- if(ev.type==='checkout.session.completed'&&PLANS[o.metadata?.plan]){db.prepare('UPDATE users SET plan=?,stripe_customer=? WHERE id=?').run(o.metadata.plan,o.customer,o.client_reference_id);log(o.client_reference_id,'plan.upgrade',o.metadata.plan)}
- if(ev.type==='customer.subscription.deleted')db.prepare("UPDATE users SET plan='free' WHERE stripe_customer=?").run(o.customer);
- res.json({received:true})});
 app.use(express.json({limit:'50kb'}));app.use(cookie());
 app.use('/api',rl({windowMs:60000,limit:300}));
+app.use('/api',(q,r,n)=>{r.set('Cache-Control','no-store');n()});
+app.get('/api/health',(q,r)=>r.json({ok:1,version:require('./package.json').version}));
+app.get('/api/config',(q,r)=>r.json({google:!!(process.env.GOOGLE_CLIENT_ID&&process.env.GOOGLE_CLIENT_SECRET)}));
 const authLimit=rl({windowMs:15*60000,limit:20,message:{error:'Too many attempts. Try again later.'}});
 const setSession=(res,u)=>res.cookie('st',jwt.sign({id:u.id,tv:u.tv||0},JWT,{expiresIn:'7d'}),{httpOnly:true,sameSite:'strict',secure:prod,maxAge:7*864e5});
 const auth=(req,res,next)=>{try{const{id,tv}=jwt.verify(req.cookies.st,JWT);req.u=db.prepare('SELECT * FROM users WHERE id=?').get(id);if(!req.u||(req.u.tv||0)!==(tv||0))throw 0;if(!PLANS[req.u.plan])req.u.plan='free';next()}catch{res.status(401).json({error:'Not signed in'})}};
-const pub=u=>({id:u.id,email:u.email,name:u.name,plan:u.plan,since:u.created,limits:PLANS[u.plan]});
+const pub=u=>({id:u.id,email:u.email,name:u.name,plan:u.plan,since:u.created,google:!!u.google,limits:PLANS[u.plan]});
 const used=id=>db.prepare('SELECT COALESCE(SUM(size),0) s FROM files WHERE user_id=?').get(id).s;
 app.post('/api/auth/register',authLimit,(req,res)=>{const{email,password,name}=req.body||{};
  if(!/^\S+@\S+\.\S+$/.test(email||'')||(password||'').length<10)return res.status(400).json({error:'Valid email and a password of 10+ characters required'});
@@ -68,9 +63,13 @@ app.get('/api/auth/google/callback',authLimit,async(req,res)=>{try{const{code,st
  const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({code:String(code),client_id:process.env.GOOGLE_CLIENT_ID,client_secret:process.env.GOOGLE_CLIENT_SECRET,redirect_uri:gBase(req)+'/api/auth/google/callback',grant_type:'authorization_code'})}),t=await r.json();if(!r.ok||!t.access_token)throw new Error('token');
  const p=await(await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:'Bearer '+t.access_token}})).json();if(!p.email||p.email_verified!==true)throw new Error('email');
  const email=String(p.email).toLowerCase();let u=db.prepare('SELECT * FROM users WHERE email=?').get(email);
- if(!u){u={id:uid(),email,name:String(p.name||'').slice(0,80),hash:bcrypt.hashSync(crypto.randomBytes(32).toString('hex'),12),plan:'free',stripe_customer:null,created:now()};db.prepare('INSERT INTO users(id,email,name,hash,plan,stripe_customer,created) VALUES(@id,@email,@name,@hash,@plan,@stripe_customer,@created)').run(u);log(u.id,'auth.register','google',req)}else log(u.id,'auth.login','google',req);
- setSession(res,u);res.redirect('/')}catch(e){res.redirect('/?auth_error=google_failed')}});
-app.get('/api/me',auth,(req,res)=>res.json({...pub(req.u),used:used(req.u.id),plans:PLANS,demoBilling:process.env.DEMO_BILLING==='true'}));
+ let note='';
+ if(!u){u={id:uid(),email,name:String(p.name||'').slice(0,80),hash:bcrypt.hashSync(crypto.randomBytes(32).toString('hex'),12),plan:'free',stripe_customer:null,created:now()};db.prepare('INSERT INTO users(id,email,name,hash,plan,stripe_customer,created) VALUES(@id,@email,@name,@hash,@plan,@stripe_customer,@created)').run(u);db.prepare('UPDATE users SET google=1 WHERE id=?').run(u.id);u.google=1;log(u.id,'auth.register','google',req)}
+ else if(!u.google){ // existing email+password account: Google now proves who owns this email. Disable the old password and end old sessions, so anyone who pre-registered this email loses access.
+  db.prepare('UPDATE users SET google=1,hash=?,tv=COALESCE(tv,0)+1 WHERE id=?').run(bcrypt.hashSync(crypto.randomBytes(32).toString('hex'),12),u.id);u=db.prepare('SELECT * FROM users WHERE id=?').get(u.id);log(u.id,'auth.google_linked','',req);note='?notice=google_linked'}
+ else log(u.id,'auth.login','google',req);
+ setSession(res,u);res.redirect('/'+note)}catch(e){res.redirect('/?auth_error=google_failed')}});
+app.get('/api/me',auth,(req,res)=>res.json({...pub(req.u),used:used(req.u.id),plans:PLANS,billing:BILLING}));
 const upload=multer({dest:TMP,limits:{fileSize:2*GB}});
 app.get('/api/files',auth,(req,res)=>res.json(db.prepare('SELECT id,name,size,mime,created,starred,trashed FROM files WHERE user_id=? ORDER BY created DESC').all(req.u.id)));
 app.post('/api/files',auth,upload.single('file'),(req,res)=>{const f=req.file,P=PLANS[req.u.plan],rm=()=>f&&fs.rm(f.path,()=>{});
@@ -78,7 +77,7 @@ app.post('/api/files',auth,upload.single('file'),(req,res)=>{const f=req.file,P=
  const name=path.basename(f.originalname).slice(0,200);
  if(BLOCK.test(name)){rm();return res.status(400).json({error:'Executable file types are blocked for safety'})}
  if(f.size>P.maxFile){rm();return res.status(413).json({error:`${P.name} plan allows files up to ${Math.round(P.maxFile/MB)} MB`})}
- if(used(req.u.id)+f.size>P.quota){rm();return res.status(402).json({error:'Storage full. Upgrade your plan for more space.'})}
+ if(used(req.u.id)+f.size>P.quota){rm();return res.status(402).json({error:'Storage full. Delete files you no longer need to free up space.'})}
  const id=uid(),key=crypto.randomBytes(32),iv=crypto.randomBytes(12),c=crypto.createCipheriv('aes-256-gcm',key,iv);
  fs.createReadStream(f.path).pipe(c).pipe(fs.createWriteStream(path.join(FD,id))).on('finish',()=>{rm();
   try{db.prepare('INSERT INTO files(id,user_id,name,size,mime,iv,tag,wkey,created) VALUES(?,?,?,?,?,?,?,?,?)').run(id,req.u.id,name,f.size,f.mimetype,iv.toString('hex'),c.getAuthTag().toString('hex'),wrap(key),now());
@@ -90,8 +89,8 @@ app.delete('/api/files/:id',auth,(req,res)=>{const f=own(req);if(!f)return res.s
 app.get('/api/links',auth,(req,res)=>res.json(db.prepare('SELECT l.id,f.name,l.expires,l.max_dl,l.dl,l.revoked,l.created,(l.pw_hash IS NOT NULL) pw FROM links l JOIN files f ON f.id=l.file_id WHERE l.user_id=? ORDER BY l.created DESC').all(req.u.id)));
 app.post('/api/links',auth,(req,res)=>{const{fileId,hours=24,password,maxDownloads}=req.body||{},f=db.prepare('SELECT * FROM files WHERE id=? AND user_id=?').get(fileId,req.u.id),P=PLANS[req.u.plan];
  if(!f)return res.sendStatus(404);
- if(db.prepare('SELECT COUNT(*) c FROM links WHERE user_id=? AND revoked=0 AND expires>?').get(req.u.id,now()).c>=P.links)return res.status(402).json({error:'Active link limit reached. Upgrade or revoke a link.'});
- if((password||maxDownloads)&&req.u.plan==='free')return res.status(402).json({error:'Passwords and download limits are Plus features.'});
+ if(db.prepare('SELECT COUNT(*) c FROM links WHERE user_id=? AND revoked=0 AND expires>?').get(req.u.id,now()).c>=P.links)return res.status(402).json({error:'Active link limit reached. Revoke a link you no longer need.'});
+ if((password||maxDownloads)&&BILLING&&req.u.plan==='free')return res.status(402).json({error:'Passwords and download limits are Plus features.'});
  const token=crypto.randomBytes(32).toString('base64url'),h=Math.min(Math.max(+hours||24,5/60),P.maxHours);
  db.prepare('INSERT INTO links(id,file_id,user_id,token_hash,pw_hash,expires,max_dl,created) VALUES(?,?,?,?,?,?,?,?)').run(uid(),f.id,req.u.id,sha(token),password?bcrypt.hashSync(String(password),10):null,now()+h*36e5,Math.floor(+maxDownloads)>0?Math.floor(+maxDownloads):null,now());
  log(req.u.id,'link.create',f.name,req);res.json({url:`${process.env.APP_URL||`${req.protocol}://${req.get('host')}`}/s/${token}`})});
@@ -102,6 +101,9 @@ app.get('/api/public/:t',(req,res)=>{const l=getLink(req.params.t);if(!l)return 
 app.post('/api/public/:t/download',authLimit,(req,res)=>{const l=getLink(req.params.t);if(!l)return res.status(404).json({error:'This link is invalid, expired, or revoked.'});
  if(l.pw_hash&&!bcrypt.compareSync(String(req.body?.password||''),l.pw_hash))return res.status(401).json({error:'Incorrect password'});
  if(!db.prepare('UPDATE links SET dl=dl+1 WHERE id=? AND (max_dl IS NULL OR dl<max_dl)').run(l.id).changes)return res.status(404).json({error:'This link has reached its download limit.'});log(l.user_id,'link.download',l.name,req);sendFile(db.prepare('SELECT * FROM files WHERE id=?').get(l.file_id),res)});
+db.exec('CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT,link_id TEXT,file_id TEXT,reason TEXT,ip TEXT,ts INTEGER)');
+app.post('/api/public/:t/report',authLimit,(req,res)=>{const l=db.prepare('SELECT l.*,f.name FROM links l JOIN files f ON f.id=l.file_id WHERE token_hash=?').get(sha(req.params.t));if(!l)return res.status(404).json({error:'Link not found'});
+ db.prepare('INSERT INTO reports(link_id,file_id,reason,ip,ts) VALUES(?,?,?,?,?)').run(l.id,l.file_id,String(req.body?.reason||'').slice(0,500),req.ip,now());log(l.user_id,'link.reported',l.name,req);res.json({ok:1})});
 app.get('/api/activity',auth,(req,res)=>res.json(db.prepare('SELECT action,detail,ip,ts FROM audit WHERE user_id=? ORDER BY id DESC LIMIT 100').all(req.u.id)));
 
 app.patch('/api/files/:id',auth,(req,res)=>{const f=own(req);if(!f)return res.sendStatus(404);const{name,starred,trashed}=req.body||{};
@@ -114,7 +116,7 @@ app.post('/api/me/password',authLimit,auth,(req,res)=>{const{current,next}=req.b
  if(!bcrypt.compareSync(String(current||''),req.u.hash))return res.status(401).json({error:'Current password is incorrect'});
  if(String(next||'').length<10)return res.status(400).json({error:'New password must be 10+ characters'});
  db.prepare('UPDATE users SET hash=? WHERE id=?').run(bcrypt.hashSync(next,12),req.u.id);log(req.u.id,'auth.password','',req);res.json({ok:1})});
-app.delete('/api/me',authLimit,auth,(req,res)=>{if(!bcrypt.compareSync(String(req.body?.password||''),req.u.hash))return res.status(401).json({error:'Password is incorrect'});
+app.delete('/api/me',authLimit,auth,(req,res)=>{if(req.u.google){if(req.body?.confirm!=='DELETE')return res.status(400).json({error:'Type DELETE to confirm'})}else if(!bcrypt.compareSync(String(req.body?.password||''),req.u.hash))return res.status(401).json({error:'Password is incorrect'});
  db.prepare('SELECT id FROM files WHERE user_id=?').all(req.u.id).forEach(f=>fs.rm(path.join(FD,f.id),()=>{}));
  db.prepare('DELETE FROM links WHERE user_id=?').run(req.u.id);db.prepare('DELETE FROM audit WHERE user_id=?').run(req.u.id);db.prepare('DELETE FROM users WHERE id=?').run(req.u.id);res.clearCookie('st');res.json({ok:1})});
 // converter (nothing is stored)
@@ -138,16 +140,9 @@ app.post('/api/convert',auth,cvUp.single('file'),async(req,res)=>{try{let buf,na
  else return res.status(400).json({error:'That conversion is not supported'});
  log(req.u.id,'file.convert',`${name} → ${to}`,req);res.set('Content-Type','application/octet-stream').send(out)}
  catch(e){res.status(400).json({error:'Conversion failed: '+String(e.message).slice(0,100)})}finally{req.file&&fs.rm(req.file.path,()=>{})}});
-// billing
-app.post('/api/billing/checkout',auth,async(req,res)=>{const plan=req.body?.plan;if(!PLANS[plan]||plan==='free')return res.sendStatus(400);
- const sk=process.env.STRIPE_SECRET_KEY,price=process.env['STRIPE_PRICE_'+plan.toUpperCase()];
- if(!sk||!price){if(process.env.DEMO_BILLING==='true'&&!prod){db.prepare('UPDATE users SET plan=? WHERE id=?').run(plan,req.u.id);log(req.u.id,'plan.demo',plan,req);return res.json({demo:true})}return res.status(503).json({error:'Payments not configured'})}
- const base=process.env.APP_URL||`${req.protocol}://${req.get('host')}`;
- const p=new URLSearchParams({mode:'subscription','line_items[0][price]':price,'line_items[0][quantity]':'1',success_url:base+'/?upgraded=1',cancel_url:base+'/',client_reference_id:req.u.id,customer_email:req.u.email,'metadata[plan]':plan});
- const r=await fetch('https://api.stripe.com/v1/checkout/sessions',{method:'POST',headers:{Authorization:'Bearer '+sk,'Content-Type':'application/x-www-form-urlencoded'},body:p}),j=await r.json();
- r.ok?res.json({url:j.url}):res.status(502).json({error:'Payment provider error'})});
-app.post('/api/billing/downgrade',auth,(req,res)=>{const p=PLANS[req.body?.plan]?req.body.plan:'free';if(process.env.DEMO_BILLING==='true'&&!prod)db.prepare('UPDATE users SET plan=? WHERE id=?').run(p,req.u.id);res.json({ok:1})});
 app.use(express.static(path.join(__dirname,'public')));
 app.get('/s/:t',(q,r)=>r.sendFile(path.join(__dirname,'public/index.html')));
 app.use((e,req,res,next)=>{console.error(e.message);res.status(500).json({error:'Server error'})});
+process.on('unhandledRejection',e=>console.error('unhandled:',e));
+setInterval(()=>fs.readdir(TMP,(e,l)=>(l||[]).forEach(f=>fs.stat(path.join(TMP,f),(e2,st)=>st&&Date.now()-st.mtimeMs>36e5&&fs.rm(path.join(TMP,f),()=>{})))),6e5).unref(); // clear abandoned upload temp files
 app.listen(process.env.PORT||3000,()=>console.log('Sentinel running on :'+(process.env.PORT||3000)));

@@ -4,7 +4,8 @@
  "main": "server.js",
  "scripts": {
   "start": "node server.js",
-  "dev": "node --watch server.js"
+  "dev": "node --watch server.js",
+  "backup": "node scripts/backup.js"
  },
  "dependencies": {
   "bcryptjs": "^2.4.3",
@@ -20,5 +21,6 @@
  },
  "engines": {
   "node": ">=22.13"
- }
+ },
+ "description": "Sentinel: secure, encrypted file sharing"
 }

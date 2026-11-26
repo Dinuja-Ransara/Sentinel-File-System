@@ -1,25 +1,17 @@
-# Sentinel — secure file sharing
-Encrypted vault + expiring, password-protected share links. Plans: Starter (free, 5 GB), Plus $4 (200 GB), Pro $10 (2 TB).
+# Sentinel
+Secure, encrypted file sharing. Files are sealed with AES-256-GCM (a unique key per file) before they touch disk and
+shared through expiring, password-protected, download-limited links you can revoke instantly.
 
-## Run
+**v1.0** is the free Starter plan: 5 GB, files up to 100 MB, password links, download limits, a file converter, and sign-in with Google or email. Paid plans are planned for v2.
+
+## Run locally (Node 22.13 or newer)
     npm install
-    cp .env.example .env
-    npm start        # http://localhost:3000
+    npm run dev          # http://localhost:3000   (no .env needed locally)
 
-## Security built in
-- AES-256-GCM encryption at rest, unique key per file, keys wrapped by MASTER_KEY
-- bcrypt passwords, JWT in httpOnly + SameSite=Strict cookie, login rate limiting
-- Share tokens: 256-bit random, only SHA-256 hash stored; expiry, revoke, password, download limit
-- Helmet + strict CSP, executable uploads blocked, per-plan size/storage limits, full audit log
+## Host it
+See `deploy/DEPLOY.md` (simple steps) and `OPERATIONS.md` (running the backend, backups, moderation). Release steps: `RELEASE.md`.
 
-## Go live checklist
-1. NODE_ENV=production, set JWT_SECRET and MASTER_KEY (`openssl rand -hex 32`). BACK UP MASTER_KEY: lose it = files unrecoverable.
-2. Serve behind HTTPS (Caddy/nginx/Render/Fly). Cookies are Secure in production.
-2b. (Optional) Google sign-in: set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET and register `APP_URL/api/auth/google/callback` as an authorized redirect URI.
-3. Stripe: create 2 monthly prices (Pro, Business), set STRIPE_SECRET_KEY, STRIPE_PRICE_PLUS, STRIPE_PRICE_PRO,
-   add webhook https://YOURDOMAIN/api/billing/webhook (events: checkout.session.completed, customer.subscription.deleted) → STRIPE_WEBHOOK_SECRET.
-   Set DEMO_BILLING=false.
-4. Put ./data on a persistent volume and back it up.
-
-## Not included yet (next steps)
-Email verification & password reset, 2FA, malware scanning (ClamAV), S3 storage, folders, team accounts, Stripe customer portal, ToS/Privacy pages.
+## Honest security notes
+- Encryption at rest protects stolen disks and backups. The server holds the master key, so this is not end-to-end encryption.
+- Losing `MASTER_KEY` makes every file unrecoverable. Keep an offline copy.
+- Not yet included: email verification, password reset, two-factor login, malware scanning.
